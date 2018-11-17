@@ -18,7 +18,7 @@ U can add more than one header k-v pair at one time.
 s := sling.New().Base(baseUrl).Retry(2).SleepTime(2*time.Second)
 req, err := s.New().Get("gophergram/list").Request()
 ```
-Use `Retry()` to set retry times.
+Use `Retry()` to set retry times.
 Use `SleepTime()` to set sleep time between tries.
 
 It won't do rerty by default.
