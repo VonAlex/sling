@@ -3,9 +3,14 @@ package sling
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strings"
+	"time"
 
 	goquery "github.com/google/go-querystring/query"
 )
@@ -37,6 +42,12 @@ type Sling struct {
 	queryStructs []interface{}
 	// body provider
 	bodyProvider BodyProvider
+	// max retry times
+	maxRetries int
+	// retry sleep duration
+	sleep time.Duration
+	// debug mode for some debug info about request
+	debug bool
 }
 
 // New returns a new Sling with an http DefaultClient.
@@ -96,6 +107,34 @@ func (s *Sling) Doer(doer Doer) *Sling {
 	} else {
 		s.httpClient = doer
 	}
+	return s
+}
+
+// Retry given times when request is failed.
+// It won't retry by default.
+func (s *Sling) Retry(maxRetries int) *Sling {
+	if maxRetries > 0 {
+		s.maxRetries = maxRetries
+	}
+	return s
+}
+
+// SleepTime between retry reques,using it with retry
+func (s *Sling) SleepTime(sleep time.Duration) *Sling {
+	s.sleep = sleep
+	return s
+}
+
+// DefaultRetry set default retry and sleep times
+func (s *Sling) DefaultRetry() *Sling {
+	s.maxRetries = 3
+	s.sleep = 100 * time.Millisecond
+	return s
+}
+
+// Debug mode
+func (s *Sling) Debug(debug bool) *Sling {
+	s.debug = debug
 	return s
 }
 
@@ -161,6 +200,14 @@ func (s *Sling) Connect(pathURL string) *Sling {
 // to the key's values. Header keys are canonicalized.
 func (s *Sling) Add(key, value string) *Sling {
 	s.header.Add(key, value)
+	return s
+}
+
+// Adds more key, value pairs in Headers
+func (s *Sling) Adds(headers map[string]string) *Sling {
+	for key, value := range headers {
+		s.Add(key, value)
+	}
 	return s
 }
 
@@ -362,24 +409,34 @@ func (s *Sling) Receive(successV, failureV interface{}) (*http.Response, error) 
 // are JSON decoded into the value pointed to by successV and other responses
 // are JSON decoded into the value pointed to by failureV.
 // Any error sending the request or decoding the response is returned.
-func (s *Sling) Do(req *http.Request, successV, failureV interface{}) (*http.Response, error) {
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return resp, err
-	}
-	// when err is nil, resp contains a non-nil resp.Body which must be closed
-	defer resp.Body.Close()
+func (s *Sling) Do(req *http.Request, successV, failureV interface{}) (resp *http.Response, err error) {
+	for attempts := 0; attempts <= s.maxRetries; attempts++ {
+		if s.debug {
+			fmt.Println("header:", s.header)
+			fmt.Println("request:", req.URL.String())
+			body, _ := ioutil.ReadAll(req.Body)
+			fmt.Println("body:", body)
+		}
+		resp, err := s.httpClient.Do(req)
+		defer resp.Body.Close() // when err is nil, resp contains a non-nil resp.Body which must be closed
+		if err != nil {
+			continue
+		}
+		// Don't try to decode on 204s
+		if resp.StatusCode == http.StatusNoContent {
+			continue
+		}
 
-	// Don't try to decode on 204s
-	if resp.StatusCode == 204 {
-		return resp, nil
+		// Decode from json
+		if successV != nil || failureV != nil {
+			succReq, err := decodeResponseJSON(resp, successV, failureV)
+			if err != nil || !succReq {
+				continue
+			}
+		}
+		break
 	}
-
-	// Decode from json
-	if successV != nil || failureV != nil {
-		err = decodeResponseJSON(resp, successV, failureV)
-	}
-	return resp, err
+	return
 }
 
 // decodeResponse decodes response Body into the value pointed to by successV
@@ -387,22 +444,42 @@ func (s *Sling) Do(req *http.Request, successV, failureV interface{}) (*http.Res
 // otherwise. If the successV or failureV argument to decode into is nil,
 // decoding is skipped.
 // Caller is responsible for closing the resp.Body.
-func decodeResponseJSON(resp *http.Response, successV, failureV interface{}) error {
+func decodeResponseJSON(resp *http.Response, successV, failureV interface{}) (succReq bool, err error) {
 	if code := resp.StatusCode; 200 <= code && code <= 299 {
 		if successV != nil {
-			return decodeResponseBodyJSON(resp, successV)
+			err = decodeResponseBodyJSON(resp, successV)
+			if err != nil {
+				return
+			}
+			succReq = true
+			return
 		}
 	} else {
 		if failureV != nil {
-			return decodeResponseBodyJSON(resp, failureV)
+			err = decodeResponseBodyJSON(resp, failureV)
+			return
 		}
 	}
-	return nil
+	return
 }
 
 // decodeResponseBodyJSON JSON decodes a Response Body into the value pointed
 // to by v.
 // Caller must provide a non-nil v and close the resp.Body.
 func decodeResponseBodyJSON(resp *http.Response, v interface{}) error {
-	return json.NewDecoder(resp.Body).Decode(v)
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	val := reflect.ValueOf(v)
+	// v may a string.
+	if val.Kind() == reflect.Ptr && val.Elem().Kind() == reflect.String { // support *string
+		val.Elem().SetString(string(body))
+		return nil
+	}
+	d := json.NewDecoder(strings.NewReader(string(body)))
+	// hanle long number tansfer
+	// see https://stackoverflow.com/questions/22343083/json-marshaling-with-long-numbers-in-golang-gives-floating-point-number
+	d.UseNumber()
+	return d.Decode(v)
 }
