@@ -1,5 +1,5 @@
 ## synopsis
-An Improved version of [sling](https://github.com/dghubble/sling), mainly fro retry mechanism & debug info.
+An Improved version of [sling](https://github.com/dghubble/sling), mainly for retry mechanism & debug info.
 
 ## New API
 ### Headers
